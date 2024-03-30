@@ -1,12 +1,16 @@
 import datetime as dt
 import json
 import os
+import time
 from io import BytesIO
 from typing import Sequence
 
 from PIL import Image
+import PIL.ImageOps
+import pytesseract
 from bs4 import BeautifulSoup
 from requests import session
+from aip import AipOcr
 
 
 class UserNamePasswordError(ValueError):
@@ -33,7 +37,7 @@ class CFMMCCrawler(object):
 
     def __init__(self, fund_name: str, broker: str,
                  account_no: str, password: str,
-                 output_dir: str, tushare_token: str) -> None:
+                 output_dir: str, tushare_token: str, app_id: str, api_key: str, secret_key: str) -> None:
         """
         从期货保证金结算中心下载期货结算单到本地
         本地输出地址为 output_dir/fund_name/broker_account_no/日报 或 月报/逐日 或 逐笔/account_no_date.xls
@@ -47,12 +51,12 @@ class CFMMCCrawler(object):
 
         self.fund_name, self.broker = fund_name, broker
         self.account_no, self.password = account_no, password
-
+        self.app_id, self.api_key, self.secret_key = app_id, api_key, secret_key
         self.output_dir = output_dir
         self.tushare_token = tushare_token
-
         self._ss = None
         self.token = None
+        self.client = AipOcr(self.app_id, self.api_key, self.secret_key)
 
     def login(self) -> None:
         """
@@ -64,31 +68,39 @@ class CFMMCCrawler(object):
         bs = BeautifulSoup(res.text, features="lxml")
         token = bs.body.form.input['value']
         verification_code_url = self.base_url + bs.body.form.img['src']
-        tmp_file = BytesIO()
-        tmp_file.write(self._ss.get(verification_code_url).content)
-        with Image.open(tmp_file) as img:
-            img.show()
-            verification_code = input('请输入验证码: ')
+        for i in range(50):
+            print(f'第{i + 1}次尝试识别验证码')
+            verification_bytes = self._ss.get(verification_code_url).content
+            ocr_result = self.client.basicGeneral(verification_bytes)
+            if 'words_result_num' in ocr_result.keys() and ocr_result['words_result_num'] > 0:
+                verification_code = ocr_result['words_result'][0]['words']
+                print('验证码：', verification_code)
+            elif 'error_code' in result.keys():
+                print(result['error_msg'])
+                continue
+            if not verification_code:
+                print('验证码为空')
+                continue
 
-        if not verification_code:
-            raise VerificationCodeError('验证码为空')
+            post_data = {
+                "org.apache.struts.taglib.html.TOKEN": token,
+                "showSaveCookies": '',
+                "userID": self.account_no,
+                "password": self.password,
+                "vericode": verification_code,
+            }
+            data_page = self._ss.post(self.login_url, data=post_data, headers=self.header, timeout=5)
 
-        post_data = {
-            "org.apache.struts.taglib.html.TOKEN": token,
-            "showSaveCookies": '',
-            "userID": self.account_no,
-            "password": self.password,
-            "vericode": verification_code,
-        }
-        data_page = self._ss.post(self.login_url, data=post_data, headers=self.header, timeout=5)
-
-        if "验证码错误" in data_page.text:
-            raise VerificationCodeError('登录失败, 验证码错误, 请重试!')
-        if '请勿在公用电脑上记录您的查询密码' in data_page.text:
-            raise UserNamePasswordError('用户名密码错误!')
-
-        print('登录成功...')
-        self.token = self._get_token(data_page.text)
+            if "验证码错误" in data_page.text:
+                time.sleep(1)
+                verification_code_url = "https://investorservice.cfmmc.com/veriCode.do?t=" + str(
+                    int(time.time() * 1000))
+            elif '请勿在公用电脑上记录您的查询密码' in data_page.text:
+                raise UserNamePasswordError('用户名密码错误!')
+            else:
+                print('登录成功...')
+                self.token = self._get_token(data_page.text)
+                break
 
     def logout(self) -> None:
         """
@@ -222,7 +234,8 @@ if __name__ == '__main__':
         config = json.load(f)
 
     # integrity check
-    needed_keys = ['tushare_token', 'accounts', 'start_date', 'end_date', 'output_dir']
+    needed_keys = ['tushare_token', 'accounts', 'start_date', 'end_date', 'output_dir', 'app_id', 'api_key',
+                   'secret_key']
     for key in needed_keys:
         if key not in config.keys():
             raise ValueError(key + '不在config中')
@@ -230,9 +243,10 @@ if __name__ == '__main__':
     # let it begin
     for account in config['accounts']:
         crawler = CFMMCCrawler(account['fund_name'], account['broker'], account['account_no'], account['password'],
-                               config['output_dir'], config['tushare_token'])
+                               config['output_dir'], config['tushare_token'], config['app_id'], config['api_key'],
+                               config['secret_key'])
         print('正在登陆 ', account['fund_name'], ' - ', account['broker'])
-        while crawler.token is None:
+        if crawler.token is None:
             try:
                 crawler.login()
             except UserNamePasswordError as e:

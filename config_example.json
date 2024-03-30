@@ -3,6 +3,9 @@
   "start_date": "20190603",
   "end_date": "20190611",
   "output_dir": "./data",
+  "app_id": "******",
+  "api_key": "******",
+  "secret_key": "******",
   "accounts": [
     {
       "fund_name": "***",
